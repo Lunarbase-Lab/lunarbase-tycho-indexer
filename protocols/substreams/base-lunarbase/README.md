@@ -43,6 +43,11 @@ parameters. Each pool becomes a component keyed by its proxy address. `quote_cal
 is required and applies to every pool in the manifest; it must match the caller
 seen by the Pool during execution.
 
+This address selects the Pool's caller-dependent fee policy, not a Tycho router
+fee. The executor runs through the router via `delegatecall`, so the Pool sees the
+router as `msg.sender`. Whitelisting that address applies multiplier one to the
+Pool's directional fee and immediate punishment; it does not make swaps free.
+
 ## State schema and quote compatibility
 
 Package 0.2.0 requires the corresponding Tycho simulator using
@@ -75,6 +80,11 @@ Changing `quote_caller` requires a fresh replay because whitelist events for oth
 addresses were previously ignored; replace any bootstrap snapshot with one for the
 new caller. Quotes from this feed are specific to that caller; reconcile its
 whitelist status and multiplier with block-pinned getters.
+
+The later Pool policy that also checks `blacklist[tx.origin]` is outside this
+v0.4.1 integration. This feed does not track transaction-origin blacklist entries
+or model their effect on fees.
+
 Fee-accounting buckets remain unindexed. Reserve transitions assume standard
 tokens and sufficient capacity for all fees to be credited to their buckets.
 
@@ -99,8 +109,9 @@ path as `bootstrap_states` is unsupported.
 
 The parser requires `block_number == bootstrap_block - 1`, the configured caller,
 all attributes and their expected byte widths. At bootstrap it verifies the actual
-parent block hash, seeds the complete attributes and active reserve balances, then
-applies the bootstrap block's events. A mismatched parent hash stops indexing.
+parent block hash once when consuming each pool's snapshot, seeds the complete
+attributes and active reserve balances, then applies the bootstrap block's events.
+A mismatched parent hash stops indexing.
 
 Without `bootstrap_states`, initialization starts paused with zero price, reserves,
 fees and maximum punishment, block delay two, multiplier one and a non-whitelisted

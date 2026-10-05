@@ -21,13 +21,6 @@ pub fn map_protocol_changes(
     component_store: StoreGetProto<tycho::ProtocolComponent>,
 ) -> Result<tycho::BlockChanges> {
     let config = Config::parse(&params)?;
-    config.validate_bootstrap_parent(
-        block.number,
-        block
-            .header
-            .as_ref()
-            .map(|header| header.parent_hash.as_slice()),
-    )?;
     let mut known_components = config
         .pools
         .iter()
@@ -57,6 +50,13 @@ pub fn map_protocol_changes(
             builder.add_protocol_component(&component);
             let initial_state = match config.bootstrap_states.get(&pool.pool) {
                 Some(snapshot) => {
+                    // Validate once, when consuming the parent snapshot for this pool.
+                    snapshot.validate_parent(
+                        block
+                            .header
+                            .as_ref()
+                            .map(|header| header.parent_hash.as_slice()),
+                    )?;
                     for balance in
                         snapshot.balance_changes(&component.id, pool.token_x, pool.token_y)
                     {

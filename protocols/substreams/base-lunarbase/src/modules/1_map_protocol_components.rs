@@ -13,13 +13,6 @@ pub fn map_protocol_components(
     block: eth::v2::Block,
 ) -> Result<tycho::BlockTransactionProtocolComponents> {
     let config = Config::parse(&params)?;
-    config.validate_bootstrap_parent(
-        block.number,
-        block
-            .header
-            .as_ref()
-            .map(|header| header.parent_hash.as_slice()),
-    )?;
     let mut tx_components = Vec::<tycho::TransactionProtocolComponents>::new();
     for pool in config
         .pools

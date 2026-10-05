@@ -277,7 +277,7 @@ mod tests {
         topics.extend(
             indexed
                 .iter()
-                .map(|token| ethabi::encode(&[token.clone()])),
+                .map(|token| ethabi::encode(std::slice::from_ref(token))),
         );
         eth::v2::Log { topics, data: ethabi::encode(data), ..Default::default() }
     }

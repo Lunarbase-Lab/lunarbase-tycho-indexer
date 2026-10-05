@@ -8,6 +8,8 @@ pub fn component_id(pool: Address) -> String {
     format!("0x{}", hex::encode(pool))
 }
 
+/// `quote_caller` is the Pool's `msg.sender` (the router for delegatecalled executors).
+/// It selects the Pool's whitelist fee multiplier, independently of Tycho router fees.
 pub fn protocol_component(
     pool: Address,
     token_x: Address,

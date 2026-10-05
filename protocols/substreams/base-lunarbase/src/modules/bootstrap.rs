@@ -15,6 +15,17 @@ pub struct BootstrapState {
 }
 
 impl BootstrapState {
+    pub fn validate_parent(&self, parent_hash: Option<&[u8]>) -> Result<()> {
+        if parent_hash != Some(self.block_hash.as_slice()) {
+            bail!(
+                "LunarBase bootstrap parent hash mismatch; expected parent block {} hash 0x{}",
+                self.block_number,
+                hex::encode(self.block_hash),
+            );
+        }
+        Ok(())
+    }
+
     pub fn entity_change(&self, component_id: &str) -> tycho::EntityChanges {
         tycho::EntityChanges {
             component_id: component_id.to_owned(),
@@ -197,18 +208,14 @@ mod tests {
     #[test]
     fn verifies_parent_number_hash_and_caller_binding() {
         let parsed = config(&snapshots()).unwrap();
-        assert!(parsed
-            .validate_bootstrap_parent(10, Some(&PARENT_HASH))
+        let snapshot = &parsed.bootstrap_states[&parse_address(POOL).unwrap()];
+        assert!(snapshot
+            .validate_parent(Some(&PARENT_HASH))
             .is_ok());
-        assert!(parsed
-            .validate_bootstrap_parent(10, Some(&[0; 32]))
+        assert!(snapshot
+            .validate_parent(Some(&[0; 32]))
             .is_err());
-        assert!(parsed
-            .validate_bootstrap_parent(10, None)
-            .is_err());
-        assert!(parsed
-            .validate_bootstrap_parent(11, None)
-            .is_ok());
+        assert!(snapshot.validate_parent(None).is_err());
         for (field, invalid) in [
             ("block_number", serde_json::json!(10)),
             ("quote_caller", serde_json::json!(POOL)),

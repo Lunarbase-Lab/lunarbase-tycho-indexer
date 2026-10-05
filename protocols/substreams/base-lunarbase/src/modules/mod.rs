@@ -91,28 +91,6 @@ mod config {
             }
             Ok(config)
         }
-
-        pub fn validate_bootstrap_parent(
-            &self,
-            block_number: u64,
-            parent_hash: Option<&[u8]>,
-        ) -> Result<()> {
-            for pool in self
-                .pools
-                .iter()
-                .filter(|pool| pool.bootstrap_block == Some(block_number))
-            {
-                if let Some(snapshot) = self.bootstrap_states.get(&pool.pool) {
-                    if parent_hash != Some(snapshot.block_hash.as_slice()) {
-                        return Err(anyhow!(
-                            "LunarBase bootstrap parent hash mismatch for {} at block {block_number}; expected parent block {} hash 0x{}",
-                            pool.component_id(), snapshot.block_number, hex::encode(snapshot.block_hash),
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
     }
 
     impl PoolConfig {

@@ -327,6 +327,9 @@ fn quote_limit(
     loop {
         match state.quote_exact_in(token_in, token_out, biguint_to_u256(&amount_in)?) {
             Ok((amount_out, _)) => return Ok((amount_in, u256_to_biguint(amount_out))),
+            Err(QuoteError::Paused | QuoteError::Stale { .. }) => {
+                return Ok((BigUint::ZERO, BigUint::ZERO));
+            }
             Err(QuoteError::Rejected | QuoteError::ReserveOverflow) => {
                 amount_in >>= 1;
                 if amount_in == BigUint::ZERO {
@@ -493,6 +496,77 @@ mod tests {
             err,
             QuoteError::Stale { block_number: 102, latest_update_block: 100, block_delay: 2 }
         );
+    }
+
+    #[test]
+    fn unavailable_pools_have_zero_limits_but_still_reject_swaps() {
+        for (paused, head_block) in [(true, 100), (false, 102), (true, 103)] {
+            let mut state = state();
+            state.paused = paused;
+            state.head_block = head_block;
+            for (sell, buy) in [(state.token_x, state.token_y), (state.token_y, state.token_x)] {
+                assert_eq!(
+                    state
+                        .get_limits(Bytes::from(sell), Bytes::from(buy))
+                        .unwrap(),
+                    (BigUint::ZERO, BigUint::ZERO)
+                );
+                assert!(state
+                    .get_amount_out(
+                        BigUint::from(1_000u64),
+                        &token(sell, "IN", 18),
+                        &token(buy, "OUT", 18),
+                    )
+                    .is_err());
+            }
+            assert!(state
+                .get_limits(Bytes::from(addr(3)), Bytes::from(state.token_y))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn limits_recover_after_unpause_or_fresh_operator_update() {
+        let mut state = state();
+        let sell = Bytes::from(state.token_x);
+        let buy = Bytes::from(state.token_y);
+        let available_limits = state
+            .get_limits(sell.clone(), buy.clone())
+            .unwrap();
+        assert!(available_limits.0 > BigUint::ZERO);
+        assert!(available_limits.1 > BigUint::ZERO);
+
+        state.paused = true;
+        assert_eq!(
+            state
+                .get_limits(sell.clone(), buy.clone())
+                .unwrap()
+                .0,
+            BigUint::ZERO
+        );
+        apply_delta(&mut state, HashMap::from([("paused".to_owned(), Bytes::from([0u8]))]))
+            .unwrap();
+        assert_eq!(
+            state
+                .get_limits(sell.clone(), buy.clone())
+                .unwrap(),
+            available_limits
+        );
+
+        state.apply_block(&BlockContext::new(102, 0));
+        assert_eq!(
+            state
+                .get_limits(sell.clone(), buy.clone())
+                .unwrap()
+                .0,
+            BigUint::ZERO
+        );
+        apply_delta(
+            &mut state,
+            HashMap::from([("latest_update_block".to_owned(), Bytes::from(102u64))]),
+        )
+        .unwrap();
+        assert_eq!(state.get_limits(sell, buy).unwrap(), available_limits);
     }
 
     #[test]
