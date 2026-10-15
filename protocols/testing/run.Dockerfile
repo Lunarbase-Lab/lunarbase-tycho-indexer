@@ -35,6 +35,7 @@ WORKDIR /build/tycho-protocol-sdk/protocols/substreams
 # copy ethereum-uniswap-v4 so no-hooks and its parent-local target directory are both present.
 RUN resolve_base() { \
         case "$1" in \
+            bsc-lunarbase) echo "base-lunarbase" ;; \
             base-alienbase-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             robinhood-sushiswap-v3|robinhood-robinswap-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             robinhood-ramses-v3) echo "polygon-ramses-v3" ;; \
@@ -45,6 +46,7 @@ RUN resolve_base() { \
             arc-uniswap-v2) echo "ethereum-uniswap-v2" ;; \
             arc-uniswap-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             arc-uniswap-v4-no-hooks) echo "ethereum-uniswap-v4" ;; \
+            bsc-ring-swap-v2) echo "ethereum-ring-swap-v2" ;; \
             ethereum-pancakeswap-v2) echo "ethereum-uniswap-v2" ;; \
             ethereum-sushiswap-v2) echo "ethereum-uniswap-v2" ;; \
             unichain-curve) echo "ethereum-curve" ;; \
@@ -84,6 +86,7 @@ COPY --from=protocol-sdk-builder /build/tycho-protocol-sdk/protocols/substreams 
 # copy ethereum-uniswap-v4 so no-hooks and its parent-local target directory are both present.
 RUN resolve_base() { \
         case "$1" in \
+            bsc-lunarbase) echo "base-lunarbase" ;; \
             base-alienbase-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             robinhood-sushiswap-v3|robinhood-robinswap-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             robinhood-ramses-v3) echo "polygon-ramses-v3" ;; \
@@ -94,6 +97,7 @@ RUN resolve_base() { \
             arc-uniswap-v2) echo "ethereum-uniswap-v2" ;; \
             arc-uniswap-v3) echo "ethereum-uniswap-v3-logs-only" ;; \
             arc-uniswap-v4-no-hooks) echo "ethereum-uniswap-v4" ;; \
+            bsc-ring-swap-v2) echo "ethereum-ring-swap-v2" ;; \
             ethereum-pancakeswap-v2) echo "ethereum-uniswap-v2" ;; \
             ethereum-sushiswap-v2) echo "ethereum-uniswap-v2" ;; \
             unichain-curve) echo "ethereum-curve" ;; \

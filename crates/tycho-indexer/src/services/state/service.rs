@@ -13,8 +13,9 @@
 //! That is harmless: the fold moves blocks from the copied changes into the entries, and a change
 //! applies only when it is newer than the entry's write timestamp, so nothing is applied twice or
 //! lost. Accounts check the timestamp of each value, because several extractors can write one
-//! account. Components check one timestamp for the whole entry, because one extractor writes each
-//! component, in order.
+//! account. For the same reason an account read also copies the other windows' blocks up to the
+//! resolved version, one window lock at a time. Components check one timestamp for the whole
+//! entry, because one extractor writes each component, in order.
 //! A fold can also carry an entry past the requested version; the request then falls back with
 //! [`FallbackReason::EntryNewer`].
 //!
@@ -54,11 +55,11 @@ use super::{
 ///
 /// A cache mode without a cache, or `Off` with one, cannot be expressed.
 #[derive(Clone, Debug)]
-pub enum EntityCacheSetup<T> {
+pub enum EntityCacheSetup<T, S = T> {
     /// See [`EntityCacheMode::Off`](super::EntityCacheMode::Off).
     Off,
     /// See [`EntityCacheMode::Shadow`](super::EntityCacheMode::Shadow).
-    Shadow(T),
+    Shadow(S),
     /// See [`EntityCacheMode::Serve`](super::EntityCacheMode::Serve).
     Serve(T),
 }
@@ -138,7 +139,7 @@ pub(crate) enum StateServiceError {
     /// The version is a block number above the window tip.
     #[error("Version {0:?} is above the window tip")]
     VersionAboveTip(BlockOrTimestamp),
-    /// An uncached address has no delta in this extractor's window.
+    /// An uncached address has no delta in any window.
     #[error("Contract {0} not found")]
     ContractNotFound(Bytes),
     /// The window lock of `system` is poisoned.
@@ -150,6 +151,15 @@ pub(crate) enum StateServiceError {
     /// A window change cannot be merged into an entry.
     #[error("Window change cannot be merged: {0}")]
     Merge(#[from] MergeError),
+}
+
+/// What a read depends on besides the request: the window of the requested system and the entity
+/// cache. A read straddles a change when the tokens taken before and after it differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StraddleToken {
+    /// `None` when the system has no window or its lock is poisoned; the read then fails anyway.
+    window_generation: Option<u64>,
+    folds: u64,
 }
 
 /// Answers state requests from the delta windows and the entity cache. Never reads the database.
@@ -167,18 +177,63 @@ impl StateService {
         Self { windows, cache }
     }
 
+    /// Reads the [`StraddleToken`] of `protocol_system`.
+    pub(crate) fn straddle_token(&self, protocol_system: &str) -> StraddleToken {
+        let window_generation = self
+            .windows
+            .get(protocol_system)
+            .and_then(|window| window.lock().ok())
+            .map(|window| window.generation());
+        StraddleToken { window_generation, folds: self.cache.folds() }
+    }
+
+    /// Whether a window other than the one of `protocol_system` holds an unsaved block at or below
+    /// `version` that changes `address`: an account delta or a token balance. `false` when
+    /// `version` does not resolve in the window of `protocol_system`. A poisoned window counts as
+    /// not holding the change.
+    pub(crate) fn unsaved_elsewhere(
+        &self,
+        protocol_system: &str,
+        version: &dto::VersionParam,
+        address: &Bytes,
+    ) -> bool {
+        let Ok((version, _)) = self.read_window(protocol_system, version) else {
+            return false;
+        };
+        self.windows
+            .iter()
+            .filter(|(system, _)| system.as_str() != protocol_system)
+            .filter_map(|(_, window)| window.lock().ok())
+            .any(|window| {
+                window
+                    .uncommitted_blocks()
+                    .is_ok_and(|mut blocks| {
+                        blocks.any(|block| {
+                            WriteTimestamp::from(&block.block) <= version &&
+                                (block
+                                    .account_deltas
+                                    .contains_key(address) ||
+                                    block
+                                        .account_balances
+                                        .contains_key(address))
+                        })
+                    })
+            })
+    }
+
     /// Serves `/contract_state` from the cache.
     ///
     /// Paginates `contract_ids` the way the database path does (slice, then page) and reports
-    /// `total` as the number of requested ids. An address the cache does not hold is built from its
-    /// deltas in this extractor's window. The database path scans every window instead.
+    /// `total` as the number of requested ids. The changes of every window up to the version apply,
+    /// as on the database path: several extractors can write one account. An address the cache
+    /// does not hold is built from its first delta in those windows.
     ///
     /// # Errors
     ///
     /// - [`StateServiceError::Fallback`] when the cache cannot rebuild the version, the request has
     ///   no `contract_ids`, or no window exists for `protocol_system`.
     /// - [`StateServiceError::ContractNotFound`] when an address is neither cached nor changed by a
-    ///   delta in the window.
+    ///   delta in any window.
     /// - [`StateServiceError::InvalidVersion`] when the version is malformed.
     /// - [`StateServiceError::VersionAboveTip`] when the version is a block number above the tip.
     /// - [`StateServiceError::LockPoisoned`], [`StateServiceError::WindowRead`] or
@@ -204,7 +259,15 @@ impl StateService {
             .collect();
         // Resolve the version and copy the window's blocks up to it under one window lock, so both
         // see the same blocks. The page's changes are collected after the lock is released.
-        let (version, blocks) = self.read_window(&request.protocol_system, &request.version)?;
+        let (version, mut blocks) = self.read_window(&request.protocol_system, &request.version)?;
+        // Several extractors can write one account, so the other windows' changes up to the
+        // version apply too, as on the database path. Sorting by timestamp restores block order
+        // across windows, which building an uncached account from its first delta needs. The sort
+        // is stable: among blocks with the same timestamp, this extractor's comes first.
+        // TODO: serve each extractor's account state from its own window only. Reading the other
+        // windows only keeps the answers the same as on the database path.
+        blocks.extend(self.other_window_blocks(&request.protocol_system, version)?);
+        blocks.sort_by_key(|block| WriteTimestamp::from(&block.block));
         let window_changes = account_changes(&blocks, &page);
 
         // Copy only the `Arc` of each cached entry under the cache read lock, so folds wait for
@@ -235,11 +298,8 @@ impl StateService {
                 .map_or(&[][..], Vec::as_slice);
             let (mut entry, changes) = match entry {
                 Some(entry) => (entry, changes),
-                // Not cached: build the account from its first delta in this extractor's window
-                // and apply the rest. Other extractors' windows are not read: each extractor
-                // serves its own state, so one extractor's delay or removal cannot change
-                // another's answers. An address with no delta here fails the whole request. The
-                // database path scans every window instead.
+                // Not cached: build the account from its first delta in the windows and apply the
+                // rest. An address with no delta fails the whole request.
                 // Token balances from blocks before the first delta are dropped, as on the
                 // database path.
                 // TODO: keep token balances an address received before its first delta, e.g. tokens
@@ -331,8 +391,8 @@ impl StateService {
                 if let Some(entry) = entry.filter(|entry| entry.updated_at() > version) {
                     debug!(
                         component = %id,
-                        entry = entry.updated_at().block_number(),
-                        version = version.block_number(),
+                        entry_ts = %entry.updated_at().block_ts(),
+                        version_ts = %version.block_ts(),
                         "Cached component is newer than the requested version"
                     );
                     return Err(StateServiceError::Fallback(FallbackReason::EntryNewer));
@@ -422,6 +482,49 @@ impl StateService {
             .map_err(StateServiceError::WindowRead)?;
         Ok((WriteTimestamp::from(&block), blocks))
     }
+
+    /// Copies the blocks of every window except `protocol_system`'s that are at or below
+    /// `version`. Each window is locked on its own, never two at once, and only the block `Arc`s
+    /// are copied. A window whose floor is above `version` contributes nothing: its blocks at or
+    /// below `version` are already folded into the cache.
+    ///
+    /// This exists only so that account reads give the same answers as the database path.
+    fn other_window_blocks(
+        &self,
+        protocol_system: &str,
+        version: WriteTimestamp,
+    ) -> Result<Vec<Arc<BlockAggregatedChanges>>, StateServiceError> {
+        let at = BlockOrTimestamp::Timestamp(version.block_ts());
+        let mut blocks = Vec::new();
+        for (system, window) in &self.windows {
+            if system == protocol_system {
+                continue;
+            }
+            let window = window
+                .lock()
+                .map_err(|err| StateServiceError::LockPoisoned {
+                    system: system.clone(),
+                    reason: err.to_string(),
+                })?;
+            let upto = match window.resolve(&at) {
+                WindowResolution::InWindow(block) => block.number,
+                WindowResolution::BelowFloor | WindowResolution::Empty => continue,
+                // A timestamp never resolves to these.
+                WindowResolution::UnknownHash | WindowResolution::AboveTip => continue,
+            };
+            let window_blocks = window
+                .blocks_upto(upto)
+                .map_err(StateServiceError::WindowRead)?;
+            // A timestamp between two blocks resolves to the later one, which is newer than
+            // `version`.
+            blocks.extend(
+                window_blocks
+                    .into_iter()
+                    .filter(|block| WriteTimestamp::from(&block.block) <= version),
+            );
+        }
+        Ok(blocks)
+    }
 }
 
 #[cfg(test)]
@@ -444,41 +547,171 @@ mod test {
     };
 
     const SYSTEM: &str = "ex";
+    /// A second extractor in the same process. Its window stays empty unless a test writes to it.
+    const OTHER: &str = "other";
 
-    /// A service over one window of `depth` blocks, folding into a cache that starts empty.
+    /// A service over the windows of `SYSTEM` and `OTHER`, `depth` blocks each, folding into a
+    /// cache that starts empty. Requests name `SYSTEM`.
     struct Harness {
         service: StateService,
         window: Arc<Mutex<DeltaWindow>>,
+        other: Arc<Mutex<DeltaWindow>>,
         cache: Arc<EntityCache>,
     }
 
     impl Harness {
         fn new(depth: u64) -> Self {
-            let window = Arc::new(Mutex::new(DeltaWindow::new(
-                SYSTEM.to_string(),
-                WindowConfig { depth, min_fold_batch: 1 },
-            )));
+            let config = WindowConfig { depth, min_fold_batch: 1 };
+            let window = Arc::new(Mutex::new(DeltaWindow::new(SYSTEM.to_string(), config)));
+            let other = Arc::new(Mutex::new(DeltaWindow::new(OTHER.to_string(), config)));
             let cache = Arc::new(EntityCache::new());
             let service = StateService::new(
-                HashMap::from([(SYSTEM.to_string(), window.clone())]),
+                HashMap::from([
+                    (SYSTEM.to_string(), window.clone()),
+                    (OTHER.to_string(), other.clone()),
+                ]),
                 cache.clone(),
             );
-            Self { service, window, cache }
+            Self { service, window, other, cache }
         }
 
-        /// Inserts `m` and folds every block that became evictable into the cache.
+        /// Inserts `m` into the window of `SYSTEM` and folds every block that became evictable.
         fn push(&self, m: BlockAggregatedChanges) {
-            let mut window = self.window.lock().unwrap();
-            window.insert(&Arc::new(m)).unwrap();
-            window
-                .fold_evictable(self.cache.as_ref())
-                .unwrap();
+            Self::push_to(&self.window, &self.cache, m);
         }
+
+        /// Inserts `m` into the window of `OTHER` and folds every block that became evictable.
+        fn push_other(&self, m: BlockAggregatedChanges) {
+            Self::push_to(&self.other, &self.cache, m);
+        }
+
+        fn push_to(window: &Mutex<DeltaWindow>, cache: &EntityCache, m: BlockAggregatedChanges) {
+            let mut window = window.lock().unwrap();
+            window.insert(&Arc::new(m)).unwrap();
+            window.fold_evictable(cache).unwrap();
+        }
+    }
+
+    #[test]
+    fn straddle_token_moves_with_a_block_or_a_fold() {
+        let harness = Harness::new(2);
+        let empty = harness.service.straddle_token(SYSTEM);
+
+        harness.push(msg(1));
+        let one_block = harness.service.straddle_token(SYSTEM);
+        // A fold from another extractor can change a shared account, so it moves the token too.
+        harness
+            .cache
+            .fold(&testing::aggregated_changes("other", 7, 7, Some(7)))
+            .unwrap();
+
+        assert_ne!(empty, one_block);
+        assert_ne!(one_block, harness.service.straddle_token(SYSTEM));
+    }
+
+    #[test]
+    fn straddle_token_moves_when_the_window_lock_is_poisoned() {
+        let harness = Harness::new(2);
+        let before = harness.service.straddle_token(SYSTEM);
+        let window = harness.window.clone();
+
+        let _ = std::thread::spawn(move || {
+            let _guard = window.lock().unwrap();
+            panic!("cache path bug");
+        })
+        .join();
+
+        assert_ne!(harness.service.straddle_token(SYSTEM), before);
+    }
+
+    /// Block 2 of `OTHER` with save watermark `committed`: block 2 is unsaved at 1, saved at 2.
+    fn other_block_2(committed: u64) -> BlockAggregatedChanges {
+        testing::aggregated_changes(OTHER, 2, 2, Some(committed))
+    }
+
+    /// `SYSTEM` holds blocks 1-3, all saved. `OTHER` holds its saved block 1, then `block`.
+    #[rstest]
+    #[case::an_unsaved_account_delta(
+        with_account(other_block_2(1), account_delta(&addr(1), 2, ChangeType::Update)),
+        at_block(3),
+        true
+    )]
+    #[case::an_unsaved_token_balance(
+        with_account_balance(other_block_2(1), &addr(1), &addr(9), 2),
+        at_block(3),
+        true
+    )]
+    #[case::a_saved_account_delta(
+        with_account(other_block_2(2), account_delta(&addr(1), 2, ChangeType::Update)),
+        at_block(3),
+        false
+    )]
+    #[case::an_unsaved_delta_above_the_version(
+        with_account(other_block_2(1), account_delta(&addr(1), 2, ChangeType::Update)),
+        at_block(1),
+        false
+    )]
+    #[case::an_unsaved_delta_for_another_address(
+        with_account(other_block_2(1), account_delta(&addr(2), 2, ChangeType::Update)),
+        at_block(3),
+        false
+    )]
+    fn unsaved_elsewhere_finds_another_extractors_unsaved_change(
+        #[case] block: BlockAggregatedChanges,
+        #[case] version: dto::VersionParam,
+        #[case] expected: bool,
+    ) {
+        let harness = Harness::new(10);
+        for n in 1..=3 {
+            harness.push(msg(n));
+        }
+        harness.push_other(other_msg(1));
+        harness.push_other(block);
+
+        assert_eq!(
+            harness
+                .service
+                .unsaved_elsewhere(SYSTEM, &version, &addr(1)),
+            expected
+        );
+    }
+
+    #[test]
+    fn unsaved_elsewhere_ignores_the_requested_systems_window() {
+        let harness = Harness::new(10);
+        harness.push(msg(1));
+        harness.push(with_account(
+            testing::aggregated_changes(SYSTEM, 2, 1, Some(1)),
+            account_delta(&addr(1), 2, ChangeType::Update),
+        ));
+
+        assert!(!harness
+            .service
+            .unsaved_elsewhere(SYSTEM, &at_block(2), &addr(1)));
+    }
+
+    #[test]
+    fn unsaved_elsewhere_is_false_for_a_version_the_window_cannot_resolve() {
+        let harness = Harness::new(10);
+        harness.push(msg(1));
+        harness.push_other(with_account(
+            testing::aggregated_changes(OTHER, 1, 0, None),
+            account_delta(&addr(1), 1, ChangeType::Update),
+        ));
+
+        assert!(!harness
+            .service
+            .unsaved_elsewhere(SYSTEM, &at_block(5), &addr(1)));
     }
 
     /// Block `n`, finalized and committed.
     fn msg(n: u64) -> BlockAggregatedChanges {
         testing::aggregated_changes(SYSTEM, n, n, Some(n))
+    }
+
+    /// Block `n` of `OTHER`, finalized and committed.
+    fn other_msg(n: u64) -> BlockAggregatedChanges {
+        testing::aggregated_changes(OTHER, n, n, Some(n))
     }
 
     fn addr(n: u64) -> Bytes {
@@ -690,6 +923,78 @@ mod test {
         );
         assert_eq!(at_7.accounts[0].slots[&word(1)], word(7));
         assert_eq!(at_7.accounts[0].token_balances, HashMap::from([(token, Bytes::from(8u64))]));
+    }
+
+    /// Two extractors track one account. The other extractor's change at or below the version
+    /// applies, and its change above the version does not.
+    #[rstest]
+    #[case::other_change_at_the_version(2, 2)]
+    #[case::other_change_below_the_version(3, 2)]
+    fn contract_state_applies_another_extractors_window_up_to_the_version(
+        #[case] version: u64,
+        #[case] expected: u64,
+    ) {
+        let harness = Harness::new(10);
+        let account = addr(1);
+        harness.push(with_account(msg(1), account_delta(&account, 1, ChangeType::Creation)));
+        harness.push(msg(2));
+        harness.push(msg(3));
+        harness.push_other(other_msg(1));
+        harness
+            .push_other(with_account(other_msg(2), account_delta(&account, 2, ChangeType::Update)));
+        harness.push_other(other_msg(3));
+        harness
+            .push_other(with_account(other_msg(4), account_delta(&account, 4, ChangeType::Update)));
+
+        let response = harness
+            .service
+            .contract_state(&contract_request(vec![account], at_block(version)))
+            .unwrap();
+
+        assert_eq!(response.accounts[0].slots[&word(1)], word(expected));
+    }
+
+    /// The other extractor stamped block 3 a microsecond later, so the version's timestamp falls
+    /// between its blocks 2 and 3. Its block 3 is newer than the version and must not apply.
+    #[test]
+    fn contract_state_skips_another_extractors_block_newer_than_the_version() {
+        let harness = Harness::new(10);
+        let account = addr(1);
+        harness.push(with_account(msg(1), account_delta(&account, 1, ChangeType::Creation)));
+        harness.push(msg(2));
+        harness.push(msg(3));
+        harness.push_other(other_msg(1));
+        harness.push_other(other_msg(2));
+        let mut later = with_account(other_msg(3), account_delta(&account, 3, ChangeType::Update));
+        later.block.ts += chrono::Duration::microseconds(1);
+        harness.push_other(later);
+
+        let response = harness
+            .service
+            .contract_state(&contract_request(vec![account], at_block(3)))
+            .unwrap();
+
+        assert_eq!(response.accounts[0].slots[&word(1)], word(1));
+    }
+
+    #[test]
+    fn contract_state_builds_an_uncached_account_from_another_extractors_window() {
+        let harness = Harness::new(10);
+        let account = addr(2);
+        harness.push(msg(1));
+        harness.push(msg(2));
+        harness.push_other(other_msg(1));
+        harness.push_other(with_account(
+            other_msg(2),
+            account_delta(&account, 2, ChangeType::Creation),
+        ));
+
+        let response = harness
+            .service
+            .contract_state(&contract_request(vec![account], at_block(2)))
+            .unwrap();
+
+        assert_eq!(response.accounts[0].slots[&word(1)], word(2));
     }
 
     #[test]

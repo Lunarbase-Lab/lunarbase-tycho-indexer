@@ -16,6 +16,7 @@ const FEE_CALCULATOR_BYTECODE_JSON: &str = include_str!("../fixtures/FeeCalculat
 // Include all executor bytecode files at compile time
 const UNISWAP_V2_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV2.runtime.json");
 const RING_SWAP_V2_BYTECODE_JSON: &str = include_str!("../fixtures/RingSwapV2.runtime.json");
+const RING_SWAP_V2_BSC_BYTECODE_JSON: &str = include_str!("../fixtures/RingSwapV2Bsc.runtime.json");
 const UNISWAP_V3_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV3.runtime.json");
 const UNISWAP_V4_BYTECODE_JSON: &str = include_str!("../fixtures/UniswapV4.runtime.json");
 const UNISWAP_V4_ANGSTROM_BYTECODE_JSON: &str =
@@ -32,9 +33,12 @@ const UNISWAP_V4_ROBINHOOD_BYTECODE_JSON: &str =
     include_str!("../fixtures/UniswapV4Robinhood.runtime.json");
 const FLUIDV1_BYTECODE_JSON: &str = include_str!("../fixtures/FluidV1.runtime.json");
 const LIQUIDITYPARTY_BYTECODE_JSON: &str = include_str!("../fixtures/LiquidityParty.runtime.json");
+const LUNARBASE_BYTECODE_JSON: &str = include_str!("../fixtures/LunarBase.runtime.json");
 const SKY_BYTECODE_JSON: &str = include_str!("../fixtures/Sky.runtime.json");
 const SLIPSTREAMS_BYTECODE_JSON: &str = include_str!("../fixtures/Slipstreams.runtime.json");
 const LIDO_V4_BYTECODE_JSON: &str = include_str!("../fixtures/LidoV4.runtime.json");
+const PANCAKESWAP_INFINITY_CL_BYTECODE_JSON: &str =
+    include_str!("../fixtures/PancakeswapInfinity.runtime.json");
 
 /// Mapping from protocol component patterns to executor bytecode JSON strings
 static EXECUTOR_MAPPING: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
@@ -59,10 +63,12 @@ static EXECUTOR_MAPPING: LazyLock<HashMap<&'static str, &'static str>> = LazyLoc
     map.insert("ekubo_v3", EKUBO_V3_BYTECODE_JSON);
     map.insert("fluid_v1", FLUIDV1_BYTECODE_JSON);
     map.insert("vm:liquidityparty", LIQUIDITYPARTY_BYTECODE_JSON);
+    map.insert("lunarbase", LUNARBASE_BYTECODE_JSON);
     map.insert("sky", SKY_BYTECODE_JSON);
     map.insert("aerodrome_slipstreams", SLIPSTREAMS_BYTECODE_JSON);
     map.insert("lido_v4", LIDO_V4_BYTECODE_JSON);
     map.insert("up_v3", SLIPSTREAMS_BYTECODE_JSON);
+    map.insert("pancakeswap_infinity_cl", PANCAKESWAP_INFINITY_CL_BYTECODE_JSON);
     map
 });
 
@@ -71,6 +77,7 @@ static EXECUTOR_MAPPING: LazyLock<HashMap<&'static str, &'static str>> = LazyLoc
 static CHAIN_SPECIFIC_EXECUTORS: LazyLock<HashMap<(Chain, &'static str), &'static str>> =
     LazyLock::new(|| {
         HashMap::from([
+            ((Chain::Bsc, "ring_swap_v2"), RING_SWAP_V2_BSC_BYTECODE_JSON),
             ((Chain::Robinhood, "ekubo_v3"), EKUBO_V3_ROBINHOOD_BYTECODE_JSON),
             ((Chain::Robinhood, "uniswap_v4"), UNISWAP_V4_ROBINHOOD_BYTECODE_JSON),
             ((Chain::Robinhood, "uniswap_v4_hooks"), UNISWAP_V4_ROBINHOOD_BYTECODE_JSON),
@@ -185,5 +192,21 @@ mod tests {
             decode_runtime_bytecode(UNISWAP_V4_ANGSTROM_BYTECODE_JSON, "executor").unwrap();
         let actual = load_executor_bytecode(Chain::Ethereum, "uniswap_v4_hooks").unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ring_swap_v2_uses_chain_specific_runtime_bytecode() {
+        let ethereum = load_executor_bytecode(Chain::Ethereum, "ring_swap_v2").unwrap();
+        let bsc = load_executor_bytecode(Chain::Bsc, "ring_swap_v2").unwrap();
+
+        assert_ne!(ethereum, bsc);
+    }
+
+    #[test]
+    fn chain_agnostic_executor_uses_default_runtime_bytecode() {
+        let ethereum = load_executor_bytecode(Chain::Ethereum, "uniswap_v2").unwrap();
+        let bsc = load_executor_bytecode(Chain::Bsc, "uniswap_v2").unwrap();
+
+        assert_eq!(ethereum, bsc);
     }
 }
